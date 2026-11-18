@@ -1,37 +1,25 @@
 """
-PHONE NUMBER EXPOSURE CHECKER (no API keys, no prompts)
+ShadowScan - Phone Number Exposure Checker (Streamlit web version)
 
-Scans YOUR OWN Gmail (read-only, Google sign-in) to estimate how
-widely your phone number is stored. It never asks for your number
-and does not search other websites.
-
-Services that hold your number AND handle money or logins (banks,
-payment apps, big accounts) raise the risk most, because a leaked
-or hijacked number can be used for SIM-swap and OTP fraud.
-
-SETUP
-  py -m pip install google-api-python-client google-auth-oauthlib
-  Put credentials.json in the same folder as this file.
+Scans YOUR OWN Gmail (read-only) to estimate how widely your phone
+number is stored. Never asks for your number. Nothing is saved.
 """
 
 import os
-import sys
 from collections import Counter
 from email.utils import parseaddr
 
-try:
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-except ImportError:
-    print("Run: py -m pip install google-api-python-client google-auth-oauthlib")
-    sys.exit(1)
+import streamlit as st
+from google.oauth2.credentials import Credentials  # noqa: F401
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
+st.set_page_config(page_title="ShadowScan", page_icon="🕵️")
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-CREDS_FILE = "credentials.json"
-TOKEN_FILE = "token.json"
-MAX_MESSAGES = 500
+MAX_MESSAGES = 200
 
 PHONE_KEYWORDS = [
     "verify your phone", "confirm your phone", "mobile number",
@@ -48,7 +36,6 @@ SECURITY_KEYWORDS = [
     "two-factor", "2-step", "password reset",
 ]
 
-# Services where a stolen number can lead to money or account loss
 HIGH_RISK = {
     "google.com", "accounts.google.com", "microsoft.com", "apple.com",
     "paypal.com", "paytm.com", "phonepe.com", "razorpay.com",
@@ -58,7 +45,6 @@ HIGH_RISK = {
     "facebookmail.com", "instagram.com", "whatsapp.com", "telegram.org",
     "linkedin.com", "twitter.com", "x.com",
 }
-
 MULTI_TLDS = {"co.uk", "co.in", "com.au", "com.br", "co.jp", "co.nz"}
 
 
@@ -69,33 +55,27 @@ def root_domain(host):
     return ".".join(parts[-2:])
 
 
-def sign_in():
-    creds = None
-    try:
-        if os.path.exists(TOKEN_FILE):
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        if not creds or not creds.valid:
-            if not os.path.exists(CREDS_FILE):
-                print("credentials.json not found in this folder.")
-                return None, None
-            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
-        svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        email = svc.users().getProfile(userId="me").execute()["emailAddress"]
-        return svc, email
-    except Exception as e:
-        print("Google sign-in failed:", e)
-        return None, None
+def make_flow():
+    cfg = {
+        "web": {
+            "client_id": st.secrets["client_id"],
+            "client_secret": st.secrets["client_secret"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [st.secrets["redirect_uri"]],
+        }
+    }
+    return Flow.from_client_config(
+        cfg,
+        scopes=SCOPES,
+        redirect_uri=st.secrets["redirect_uri"],
+        autogenerate_code_verifier=False,
+    )
 
 
 def list_ids(svc, keywords):
     query = " OR ".join('subject:"' + k + '"' for k in keywords)
-    ids = []
-    token = None
+    ids, token = [], None
     while len(ids) < MAX_MESSAGES:
         resp = svc.users().messages().list(
             userId="me", q=query, maxResults=100, pageToken=token
@@ -109,59 +89,49 @@ def list_ids(svc, keywords):
 
 def sender_counts(svc, ids):
     counts = Counter()
-    total = len(ids)
-    for i, mid in enumerate(ids, 1):
-        try:
-            msg = svc.users().messages().get(
-                userId="me", id=mid, format="metadata",
-                metadataHeaders=["From"]
-            ).execute()
-            for h in msg.get("payload", {}).get("headers", []):
-                if h["name"].lower() == "from":
-                    addr = parseaddr(h["value"])[1]
-                    if "@" in addr:
-                        counts[root_domain(addr.split("@")[-1])] += 1
-                    break
-        except Exception:
-            continue
-        if i % 25 == 0 or i == total:
-            print("  processed", i, "of", total)
+
+    def cb(_req_id, resp, exc):
+        if exc or not resp:
+            return
+        for h in resp.get("payload", {}).get("headers", []):
+            if h["name"].lower() == "from":
+                addr = parseaddr(h["value"])[1]
+                if "@" in addr:
+                    counts[root_domain(addr.split("@")[-1])] += 1
+                break
+
+    for i in range(0, len(ids), 50):
+        batch = svc.new_batch_http_request(callback=cb)
+        for mid in ids[i:i + 50]:
+            batch.add(
+                svc.users().messages().get(
+                    userId="me", id=mid, format="metadata",
+                    metadataHeaders=["From"],
+                )
+            )
+        batch.execute()
     return counts
 
 
-def main():
-    print("=" * 56)
-    print("     PHONE NUMBER EXPOSURE CHECKER (no API keys)")
-    print("=" * 56)
-
-    svc, email = sign_in()
-    if not svc:
-        return
-    print("Signed in as:", email)
-
-    try:
-        print("\nScanning for phone verification emails...")
-        phone = sender_counts(svc, list_ids(svc, PHONE_KEYWORDS))
-        print("\nScanning for phone number change emails...")
-        changes = sender_counts(svc, list_ids(svc, CHANGE_KEYWORDS))
-        print("\nScanning for security alert emails...")
-        security = sender_counts(svc, list_ids(svc, SECURITY_KEYWORDS))
-    except Exception as e:
-        print("Scan error:", e)
-        return
+def run_scan(svc):
+    bar = st.progress(0, text="Phone verification emails scan pannuren...")
+    phone = sender_counts(svc, list_ids(svc, PHONE_KEYWORDS))
+    bar.progress(35, text="Number change emails scan pannuren...")
+    changes = sender_counts(svc, list_ids(svc, CHANGE_KEYWORDS))
+    bar.progress(70, text="Security alert emails scan pannuren...")
+    security = sender_counts(svc, list_ids(svc, SECURITY_KEYWORDS))
+    bar.progress(100, text="Mudinjidichu")
+    bar.empty()
 
     holding = set(phone) | set(changes)
     high = {d for d in holding if d in HIGH_RISK}
     normal = holding - high
     sms_2fa = {d for d in security if d in holding}
 
-    risk = 0
-    risk += len(high) * 9        # money or login services hold your number
-    risk += len(normal) * 4      # other services hold your number
-    risk += len(changes) * 3     # number was added or changed somewhere
-    risk += len(sms_2fa) * 2     # also sends security alerts: likely SMS 2FA
-    risk = min(risk, 100)
-
+    risk = min(
+        len(high) * 9 + len(normal) * 4 + len(changes) * 3 + len(sms_2fa) * 2,
+        100,
+    )
     if risk <= 15:
         level = "LOW"
     elif risk <= 40:
@@ -171,46 +141,73 @@ def main():
     else:
         level = "VERY HIGH"
 
-    print("\n" + "=" * 56)
-    print("         PHONE NUMBER EXPOSURE REPORT")
-    print("=" * 56)
-    print("Account scanned:", email)
+    st.metric("Phone number exposure risk", f"{risk}%  [{level}]")
+    c1, c2 = st.columns(2)
+    c1.metric("Services holding your number", len(holding))
+    c2.metric("High-risk services", len(high))
 
-    print("\n[HIGH-RISK SERVICES HOLDING YOUR NUMBER] (%d)" % len(high))
-    print("  (money, logins, big accounts)")
-    for d in sorted(high):
-        n = phone.get(d, 0) + changes.get(d, 0)
-        print("  %-30s %d email(s)" % (d, n))
+    def show(title, domains, counter=None):
+        st.subheader(f"{title} ({len(domains)})")
+        if not domains:
+            st.caption("Onnum illa")
+        for d in sorted(domains):
+            n = (phone.get(d, 0) + changes.get(d, 0)) if counter is None else counter[d]
+            st.write(f"- **{d}** : {n} email(s)")
 
-    print("\n[OTHER SERVICES HOLDING YOUR NUMBER] (%d)" % len(normal))
-    for d in sorted(normal):
-        n = phone.get(d, 0) + changes.get(d, 0)
-        print("  %-30s %d email(s)" % (d, n))
-
-    print("\n[NUMBER ADDED OR CHANGED] (%d)" % len(changes))
-    for d in sorted(changes):
-        print("  %-30s %d email(s)" % (d, changes[d]))
-
-    print("\n[LIKELY USING SMS FOR SECURITY] (%d)" % len(sms_2fa))
+    show("High-risk services (money, logins)", high)
+    show("Other services", normal)
+    show("Number added / changed", set(changes), changes)
+    st.subheader(f"Likely using SMS for security ({len(sms_2fa)})")
     for d in sorted(sms_2fa):
-        print("  " + d)
+        st.write(f"- {d}")
 
-    print("\n" + "-" * 56)
-    print("Services holding your number : %d" % len(holding))
-    print("High-risk services           : %d" % len(high))
-    print("PHONE NUMBER EXPOSURE RISK   : %d%%  [%s]" % (risk, level))
-    print("-" * 56)
-
-    print("\nHOW TO REDUCE EXPOSURE")
-    print("1. Ask your carrier for a SIM lock or port-out PIN.")
-    print("2. Use an authenticator app instead of SMS codes.")
-    print("3. Remove your number from services you no longer use.")
-    print("4. Never share OTP codes with anyone.")
-    print("5. Use a second number for non-essential signups.")
-    print("6. Hide your number on WhatsApp and Telegram.")
-    print("\nNote: results come from email keywords and are approximate.")
-    print("Deleted emails and services that never email you are invisible.")
+    st.subheader("How to reduce exposure")
+    st.markdown(
+        "1. Carrier-kitta SIM lock / port-out PIN kelunga\n"
+        "2. SMS-ku badhula authenticator app use pannunga\n"
+        "3. Use panna services-la irundhu number remove pannunga\n"
+        "4. OTP yaarukum share pannaadhinga\n"
+        "5. Non-essential signup-ku second number use pannunga\n"
+        "6. WhatsApp / Telegram-la number hide pannunga"
+    )
+    st.caption(
+        "Results email keywords-la irundhu varudhu, so approximate dhaan. "
+        "Delete panna emails, email anuppaadha services theriyaadhu."
+    )
 
 
-if __name__ == "__main__":
-    main()
+st.title("🕵️ ShadowScan")
+st.write("Un Gmail-la (read-only) un phone number evlo places-la irukkunu estimate pannum. "
+         "Number-a kekkaadhu, edhuvum save pannaadhu.")
+
+code = st.query_params.get("code")
+if code and "creds" not in st.session_state:
+    try:
+        flow = make_flow()
+        flow.fetch_token(code=code)
+        st.session_state["creds"] = flow.credentials
+    except Exception as e:
+        st.error(f"Google sign-in fail aagiduchu: {e}")
+    st.query_params.clear()
+
+if "creds" not in st.session_state:
+    flow = make_flow()
+    url, _ = flow.authorization_url(prompt="consent", access_type="online")
+    st.link_button("🔐 Sign in with Google", url)
+    st.stop()
+
+try:
+    svc = build("gmail", "v1", credentials=st.session_state["creds"],
+                cache_discovery=False)
+    email = svc.users().getProfile(userId="me").execute()["emailAddress"]
+except Exception as e:
+    st.error(f"Gmail connect aagala: {e}")
+    st.session_state.pop("creds", None)
+    st.stop()
+
+st.success(f"Signed in as {email}")
+if st.button("Scan my Gmail", type="primary"):
+    try:
+        run_scan(svc)
+    except Exception as e:
+        st.error(f"Scan error: {e}")
